@@ -33,7 +33,7 @@ import winapi as wa
 
 APP_NAME = "ポチマクロ"
 APP_NAME_EN = "PochiMacro"
-APP_VERSION = "0.2.1"
+APP_VERSION = "0.3.0"
 
 
 def _res_dir():
@@ -630,10 +630,31 @@ class MacroPanel(tk.Frame):
         tk.Label(c, text="一連の操作", bg=th.CARD, fg=th.INK,
                  font=F["cute_b"]).pack(anchor="w", pady=(0, 4))
 
+        # ---- 場所を順番に教える（クリック検知に頼らない・いちばん確実）----
+        trow = tk.Frame(c, bg=th.CARD)
+        trow.pack(fill="x", pady=(0, 2))
+        self.btn_teach = th.RoundButton(trow, "🖱 場所を順番に教える",
+                                        self.toggle_teach, kind="primary",
+                                        bg=th.CARD, font=F["small"], padx=12,
+                                        pady=6)
+        self.btn_teach.pack(side="left")
+        tk.Label(trow, text="待つ秒数", bg=th.CARD, fg=th.INK_SUB,
+                 font=F["small"]).pack(side="left", padx=(10, 2))
+        self.v_teach_delay = tk.StringVar(value="3")
+        th.soft_entry(trow, self.v_teach_delay, width=3).pack(side="left", ipady=3)
+        self.lbl_teach = tk.Label(c, text="対象のアプリへ行って、①の場所にマウスを"
+                                        "置いたまま数秒待つと覚えます。次の場所へ"
+                                        "動かせば②、③…と続けて覚えられます"
+                                        "（クリックする必要はありません）",
+                                  bg=th.CARD, fg=th.INK_SUB, font=F["small"],
+                                  wraplength=740, justify="left")
+        self.lbl_teach.pack(anchor="w", pady=(2, 8))
+        self._teach = None
+
         rrow = tk.Frame(c, bg=th.CARD)
         rrow.pack(fill="x", pady=(0, 4))
-        self.btn_record = th.RoundButton(rrow, "⏺ 記録開始", self.toggle_record,
-                                         kind="danger", bg=th.CARD, font=F["small"],
+        self.btn_record = th.RoundButton(rrow, "⏺ 操作を記録", self.toggle_record,
+                                         kind="soft", bg=th.CARD, font=F["small"],
                                          padx=12, pady=6)
         self.btn_record.pack(side="left")
         th.RoundButton(rrow, "＋ 手で追加", self.add_step, kind="soft",
@@ -642,6 +663,12 @@ class MacroPanel(tk.Frame):
         th.RoundButton(rrow, "▶ ためす", self.test_once, kind="soft",
                        bg=th.CARD, font=F["small"], padx=10,
                        pady=6).pack(side="left", padx=6)
+        tk.Label(c, text="⏺ 操作を記録 はクリック／キー入力をそのまま拾いますが、"
+                        "ゲームによっては（とくに最前面にしたとき）拾えないこと"
+                        "があります。そのときは上の「場所を順番に教える」を"
+                        "使ってください",
+                 bg=th.CARD, fg=th.INK_SUB, font=F["small"], wraplength=740,
+                 justify="left").pack(anchor="w", pady=(0, 2))
         self.lbl_record = tk.Label(c, text="", bg=th.CARD, fg=th.INK_SUB,
                                    font=F["small"], wraplength=740, justify="left")
         self.lbl_record.pack(anchor="w", pady=(0, 6))
@@ -1035,8 +1062,72 @@ class MacroPanel(tk.Frame):
         self.update_view()
         return "break"
 
+    # ---------------- 場所を順番に教える ----------------
+    # クリックそのものを検知しない。対象アプリにマウスを置いて待つだけなので、
+    # ⏺ 操作を記録 がアンチチート等で拾えないゲームでも確実に使える。
+    def toggle_teach(self):
+        if self._teach is not None:
+            self._stop_teach("やめました")
+            return
+        if self.app.recorder is not None and self.app.recorder.is_alive():
+            self.app.recorder.stop()
+        self.save()
+        try:
+            delay = max(0.5, min(30.0, float(self.v_teach_delay.get())))
+        except (TypeError, ValueError):
+            delay = 3.0
+        self._teach = {"n": 0, "delay": delay, "job": None}
+        self.btn_teach.set_text("■ やめる")
+        self._teach_arm()
+
+    def _teach_arm(self):
+        t = self._teach
+        if t is None:
+            return
+        t["n"] += 1
+        t["remain"] = t["delay"]
+        self._teach_tick()
+
+    def _teach_tick(self):
+        t = self._teach
+        if t is None:
+            return
+        if t["remain"] <= 0:
+            pos = wa.cursor_pos()
+            p = self.app.active_profile()
+            p.setdefault("steps", []).append(
+                {"action": "left", "gap_ms": 300, "key_vk": 0, "key_scan": 0,
+                 "pos": list(pos)})
+            self.app.save_cfg()
+            self._rebuild_steps_ui()
+            self.update_view()
+            self.lbl_teach.config(
+                text="✅ %d番目: (%d, %d) を覚えました。つづけて②③…を教えるなら"
+                     "次の場所へマウスを動かしてください（終わるなら「■ やめる」）"
+                     % (t["n"], pos[0], pos[1]), fg=th.MINT)
+            t["job"] = self.after(900, self._teach_arm)
+            return
+        self.lbl_teach.config(
+            text="%d番目… あと%.1f秒（その場所で待っていてください）"
+                 % (t["n"], max(0.0, t["remain"])), fg=th.INK)
+        t["remain"] -= 0.2
+        t["job"] = self.after(200, self._teach_tick)
+
+    def _stop_teach(self, msg):
+        t = self._teach
+        if t is not None and t.get("job") is not None:
+            try:
+                self.after_cancel(t["job"])
+            except Exception:
+                pass
+        self._teach = None
+        self.btn_teach.set_text("🖱 場所を順番に教える")
+        self.lbl_teach.config(text=msg, fg=th.INK_SUB)
+
     # ---------------- 操作を記録する ----------------
     def toggle_record(self):
+        if self._teach is not None:
+            self._stop_teach("")
         if self.app.recorder is not None and self.app.recorder.is_alive():
             self.app.recorder.stop()          # 終わりはじめる。仕上げは_poll_recordで
             return
