@@ -60,7 +60,7 @@ def mode_label(name):
     return name
 
 
-MAX_STEPS = 3        # 1回に続けて送れる操作の数
+MAX_RECORD_STEPS = 500        # 記録を止め忘れて延々続けてしまったときの安全弁
 
 
 # ------------------------------------------------- 秒・分の読み書き
@@ -310,6 +310,7 @@ def post_vk(hwnd, vk, scan=None, hold_ms=20):
 def steps_of(cfg):
     """設定から操作の並びを作る。空なら、1操作として読む。
 
+    ステップの数に上限は無い（記録した一連の操作をまるごと持てる）。
     "pos": [x, y] が付いているマウス操作は、その画面座標へカーソルを
     動かしてからクリックする（卵の孵化のように、決まった場所を押しつづける
     作業のため）。付いていなければ、いまカーソルがある場所を押す。
@@ -326,8 +327,6 @@ def steps_of(cfg):
                     "gap_ms": st.get("gap_ms", 120),
                     "every": max(1, int(st.get("every") or 1)),
                     "pos": st.get("pos")})
-        if len(got) >= MAX_STEPS:
-            break
     if got:
         return got
     return [{"action": cfg.get("action") or DEFAULT_ACTION,
@@ -538,15 +537,11 @@ class Holder(threading.Thread):
 # 大事なのは「自分が送った右クリックでは止まらない」こと。低レベルフックなら
 # 注入された入力に印(LLMHF_INJECTED)が付くので、それで分ける。
 WH_MOUSE_LL = 14
-WH_KEYBOARD_LL = 13
 WM_LBUTTONDOWN_LL = 0x0201
 WM_LBUTTONUP_LL = 0x0202
 WM_RBUTTONDOWN_LL = 0x0204
 WM_RBUTTONUP_LL = 0x0205
 LLMHF_INJECTED = 0x00000001
-LLKHF_INJECTED = 0x00000010
-WM_KEYDOWN_LL, WM_KEYUP_LL = 0x0100, 0x0101
-WM_SYSKEYDOWN_LL, WM_SYSKEYUP_LL = 0x0104, 0x0105
 ULONG_PTR = wintypes.WPARAM
 
 
@@ -556,16 +551,8 @@ class MSLLHOOKSTRUCT(ctypes.Structure):
                 ("dwExtraInfo", ULONG_PTR))
 
 
-class KBDLLHOOKSTRUCT(ctypes.Structure):
-    _fields_ = (("vkCode", wintypes.DWORD), ("scanCode", wintypes.DWORD),
-                ("flags", wintypes.DWORD), ("time", wintypes.DWORD),
-                ("dwExtraInfo", ULONG_PTR))
-
-
 MOUSE_HOOKPROC = ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_int, wintypes.WPARAM,
                                     ctypes.POINTER(MSLLHOOKSTRUCT))
-KBD_HOOKPROC = ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_int, wintypes.WPARAM,
-                                  ctypes.POINTER(KBDLLHOOKSTRUCT))
 
 
 class CancelWatch(threading.Thread):
@@ -677,35 +664,40 @@ class HoldWatch(threading.Thread):
             user32.PostThreadMessageW(self._tid, WM_QUIT, 0, 0)
 
 
-_XBUTTON_OF = {1: "x1", 2: "x2"}
+VK_LBUTTON = 0x01
+_MOUSE_VK_ACTIONS = {0x01: "left", 0x02: "right", 0x04: "middle",
+                    0x05: "x1", 0x06: "x2"}
 
 
 class SequenceRecorder(threading.Thread):
-    """実際の操作（マウスクリック・キー押下）を最大want個まで記録する。
+    """実際の操作（マウスクリック・キー押下）を、一連の流れとして記録する。
 
-    マウスとキーボードの低レベルフックを両方仕掛けて、本物の入力
-    （LLMHF_INJECTED/LLKHF_INJECTED が付いていないもの）だけを拾う。
-    直前の操作からの経過時間をそのステップの「次まで」の間隔として記録する。
-    Escキーで途中終了できる（そこまでの分を確定）。修飾キー単体は無視する。
+    低レベルフック(SetWindowsHookEx)ではなく GetAsyncKeyState による
+    ポーリングで拾う。ゲームによっては（とくに管理者権限で動いているとき）
+    UIPIに阻まれてフックが本物の入力を拾えないことがあり、記録できない
+    原因になっていた。ポーリングはそれを迂回できる
+    （Meridianの「たまごマクロ」の位置記録と同じ、実績のあるやり方）。
+
+    want=0なら無制限（stop()が呼ばれる、またはEscで終わるまで記録する）。
+    exclude_vksに渡したキー／ボタン（記録の開始・終了に使ったホットキー等）
+    は、それ自体を操作として記録しない。
     """
     _MOD_VKS = {0x10, 0x11, 0x12, 0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0x5B, 0x5C}
     _VK_ESCAPE = 0x1B
 
-    def __init__(self, want=3, on_step=None):
+    def __init__(self, want=0, on_step=None, exclude_vks=None):
         super().__init__(daemon=True)
-        self.want = max(1, min(MAX_STEPS, int(want)))
+        self.want = max(0, int(want))
         self.on_step = on_step
+        self.exclude = set(exclude_vks or ())
         self.steps = []
         self._last_t = None
-        self._tid = 0
-        self._mhook = None
-        self._khook = None
-        self._mproc = None
-        self._kproc = None
-        self.ready = threading.Event()
-        self.ok = False
+        self._halt = threading.Event()
         self.done = False
         self.cancelled = False
+
+    def stop(self):
+        self._halt.set()
 
     def _push(self, action, vk=0, scan=0, pos=None):
         now = time.time()
@@ -719,73 +711,37 @@ class SequenceRecorder(threading.Thread):
                 self.on_step(len(self.steps), st)
             except Exception:
                 pass
-        if len(self.steps) >= self.want:
+        if ((self.want and len(self.steps) >= self.want)
+                or len(self.steps) >= MAX_RECORD_STEPS):
             self.done = True
             self.stop()
 
-    def _on_mouse(self, code, wparam, lparam):
-        try:
-            if code >= 0 and not self.done and not (lparam.contents.flags & LLMHF_INJECTED):
-                data = lparam.contents.mouseData
-                pt = lparam.contents.pt
-                pos = (pt.x, pt.y)
-                if wparam == WM_LBUTTONDOWN_LL:
-                    self._push("left", pos=pos)
-                elif wparam == WM_RBUTTONDOWN_LL:
-                    self._push("right", pos=pos)
-                elif wparam == 0x0207:                          # WM_MBUTTONDOWN
-                    self._push("middle", pos=pos)
-                elif wparam == 0x020B:                           # WM_XBUTTONDOWN
-                    xb = (data >> 16) & 0xFFFF
-                    act = _XBUTTON_OF.get(xb)
-                    if act:
-                        self._push(act, pos=pos)
-        except Exception:
-            pass
-        return user32.CallNextHookEx(None, code, wparam, lparam)
-
-    def _on_kbd(self, code, wparam, lparam):
-        try:
-            if (code >= 0 and not self.done
-                    and wparam in (WM_KEYDOWN_LL, WM_SYSKEYDOWN_LL)
-                    and not (lparam.contents.flags & LLKHF_INJECTED)):
-                vk = lparam.contents.vkCode
-                if vk == self._VK_ESCAPE:
-                    self.cancelled = not self.steps
-                    self.done = True
-                    self.stop()
-                elif vk not in self._MOD_VKS:
-                    scan = lparam.contents.scanCode or wa.scancode_of(vk)
-                    self._push("key", vk, scan)
-        except Exception:
-            pass
-        return user32.CallNextHookEx(None, code, wparam, lparam)
-
     def run(self):
-        self._tid = kernel32.GetCurrentThreadId()
-        self._mproc = MOUSE_HOOKPROC(self._on_mouse)
-        self._kproc = KBD_HOOKPROC(self._on_kbd)
-        self._mhook = user32.SetWindowsHookExW(WH_MOUSE_LL, self._mproc, None, 0)
-        self._khook = user32.SetWindowsHookExW(WH_KEYBOARD_LL, self._kproc, None, 0)
-        self.ok = bool(self._mhook and self._khook)
-        self.ready.set()
-        if not self.ok:
-            return
-        msg = MSG()
-        while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
-            pass
-        if self._mhook:
-            user32.UnhookWindowsHookEx(self._mhook)
-        if self._khook:
-            user32.UnhookWindowsHookEx(self._khook)
-        self._mhook = self._khook = None
-
-    def stop(self):
-        if self._tid:
-            user32.PostThreadMessageW(self._tid, WM_QUIT, 0, 0)
-
-
-VK_LBUTTON = 0x01
+        watch = [vk for vk in range(8, 256) if vk not in self._MOD_VKS]
+        # 記録を始めた時点ですでに押さえられているキー（開始に使ったホット
+        # キーなど）は、離されるまで「まだ押されている」ことにして無視する
+        prev = {vk: bool(user32.GetAsyncKeyState(vk) & 0x8000) for vk in watch}
+        while not self._halt.is_set() and not self.done:
+            for vk in watch:
+                down = bool(user32.GetAsyncKeyState(vk) & 0x8000)
+                if down and not prev[vk]:
+                    if vk == self._VK_ESCAPE:
+                        self.cancelled = not self.steps
+                        self.done = True
+                        prev[vk] = down
+                        break
+                    if vk not in self.exclude:
+                        act = _MOUSE_VK_ACTIONS.get(vk)
+                        if act:
+                            self._push(act, pos=wa.cursor_pos())
+                        else:
+                            self._push("key", vk, wa.scancode_of(vk))
+                prev[vk] = down
+                if self.done:
+                    break
+            if not self.done:
+                self._halt.wait(0.012)
+        self.done = True
 
 
 class PositionRecorder(threading.Thread):

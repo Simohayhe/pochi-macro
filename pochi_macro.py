@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
-"""ポチマクロ — マウス/キーボードの3操作マクロツール
+"""ポチマクロ — マウス/キーボードの操作を記録・繰り返し実行するマクロツール
 
-・マウスクリック / キーを最大3つまで、順番に自動実行
-・実際の操作をそのまま記録して反映（⏺ 操作を記録する）
+・一連の操作（クリック・キー、長さの上限なし）を記録して、そのまま繰り返し実行
+・押す場所を画面座標で登録可能（卵の孵化のように決まった場所を押しつづける用途）
 ・マクロを複数保存して切り替え
-・グローバルホットキーで入切
+・グローバルホットキーで入切（記録の開始/終了もホットキーから）
 ・GitHub Releasesからのアプリ内更新
 
     python pochi_macro.py
@@ -33,7 +33,7 @@ import winapi as wa
 
 APP_NAME = "ポチマクロ"
 APP_NAME_EN = "PochiMacro"
-APP_VERSION = "0.1.1"
+APP_VERSION = "0.2.0"
 
 
 def _res_dir():
@@ -73,6 +73,8 @@ DEFAULT_CONFIG = {
     "hotkey_press_on": True, "hotkey_press_mods": macro.MOD_CONTROL, "hotkey_press_vk": 0x4B,
     "hotkey_switch_on": True,
     "hotkey_switch_mods": macro.MOD_CONTROL | macro.MOD_SHIFT, "hotkey_switch_vk": 0x50,
+    "hotkey_record_on": True,
+    "hotkey_record_mods": macro.MOD_CONTROL | macro.MOD_SHIFT, "hotkey_record_vk": 0x45,
     "geometry": "780x760",
 }
 
@@ -115,7 +117,9 @@ class App(tk.Tk):
         self.macro_kind = macro.DEFAULT_MODE
         self.cancelled_at = 0.0
         self.hk_hold = self.hk_always = self.hk_press = self.hk_switch = None
-        self._hk_err = {"hold": "", "always": "", "press": "", "switch": ""}
+        self.hk_record = None
+        self._hk_err = {"hold": "", "always": "", "press": "", "switch": "",
+                        "record": ""}
         self.update_found = None
 
         th.use(self.cfg.get("theme", "cute"))
@@ -340,6 +344,11 @@ class App(tk.Tk):
             self.cancel_watch = w if w.ok else None
 
     # ---------------- ホットキー ----------------
+    def _hotkey_toggle_record(self):
+        """記録ホットキーはワーカースレッドから呼ばれるので、Tk操作はafterで本体へ渡す。"""
+        if self.panel is not None:
+            self.panel.toggle_record()
+
     def apply_hotkey(self):
         for which, head, on_key, hk_id, act, dflt in (
                 ("hk_hold", "hotkey_hold", "hotkey_hold_on", 1,
@@ -349,7 +358,9 @@ class App(tk.Tk):
                 ("hk_press", "hotkey_press", "hotkey_press_on", 3,
                  self.toggle_hold, 0x4B),
                 ("hk_switch", "hotkey_switch", "hotkey_switch_on", 4,
-                 self.switch_to_next_profile, 0x50)):
+                 self.switch_to_next_profile, 0x50),
+                ("hk_record", "hotkey_record", "hotkey_record_on", 5,
+                 lambda: self.after(0, self._hotkey_toggle_record), 0x45)):
             old = getattr(self, which)
             if old is not None:
                 old.stop()
@@ -369,13 +380,16 @@ class App(tk.Tk):
 
     def hotkey_status(self, which):
         head = {"hold": "hotkey_hold", "always": "hotkey_always",
-               "press": "hotkey_press", "switch": "hotkey_switch"}[which]
-        dflt = {"hold": 0x52, "always": 0x54, "press": 0x4B, "switch": 0x50}[which]
+               "press": "hotkey_press", "switch": "hotkey_switch",
+               "record": "hotkey_record"}[which]
+        dflt = {"hold": 0x52, "always": 0x54, "press": 0x4B, "switch": 0x50,
+               "record": 0x45}[which]
         on = self.cfg.get(head + "_on", True)
         name = macro.hotkey_name(self.cfg.get(head + "_mods", macro.MOD_CONTROL),
                                  self.cfg.get(head + "_vk", dflt))
         what = {"hold": "押しっぱなしで実行", "always": "ずっと実行",
-               "press": "長押し", "switch": "次のマクロへ切替"}[which]
+               "press": "長押し", "switch": "次のマクロへ切替",
+               "record": "操作の記録を開始/終了"}[which]
         if not on:
             return "%s のショートカットは使いません" % what, name
         err = self._hk_err.get(which)
@@ -515,7 +529,8 @@ class App(tk.Tk):
             self.recorder.stop()
         if self.cancel_watch is not None:
             self.cancel_watch.stop()
-        for hk in (self.hk_hold, self.hk_always, self.hk_press, self.hk_switch):
+        for hk in (self.hk_hold, self.hk_always, self.hk_press, self.hk_switch,
+                  self.hk_record):
             if hk is not None:
                 hk.stop()
         self.destroy()
@@ -612,26 +627,29 @@ class MacroPanel(tk.Frame):
         conf.pack(fill="x", pady=(8, 0))
         c = conf.body
 
-        tk.Label(c, text="なにを実行する？（3つまで）",
-                 bg=th.CARD, fg=th.INK, font=F["cute_b"]).pack(anchor="w",
-                                                                pady=(0, 4))
-        self.steps = []
-        saved = list(p.get("steps") or [])
-        for i in range(macro.MAX_STEPS):
-            self.steps.append(self._step_row(c, i, saved[i] if i < len(saved) else {}))
+        tk.Label(c, text="一連の操作", bg=th.CARD, fg=th.INK,
+                 font=F["cute_b"]).pack(anchor="w", pady=(0, 4))
 
         rrow = tk.Frame(c, bg=th.CARD)
-        rrow.pack(fill="x", pady=(4, 10))
-        self.btn_record = th.RoundButton(rrow, "⏺ 操作を記録する", self.toggle_record,
+        rrow.pack(fill="x", pady=(0, 4))
+        self.btn_record = th.RoundButton(rrow, "⏺ 記録開始", self.toggle_record,
                                          kind="danger", bg=th.CARD, font=F["small"],
                                          padx=12, pady=6)
         self.btn_record.pack(side="left")
-        th.RoundButton(rrow, "▶ ひと通りためす", self.test_once, kind="soft",
-                       bg=th.CARD, font=F["small"], padx=12,
+        th.RoundButton(rrow, "＋ 手で追加", self.add_step, kind="soft",
+                       bg=th.CARD, font=F["small"], padx=10,
                        pady=6).pack(side="left", padx=6)
-        self.lbl_record = tk.Label(rrow, text="", bg=th.CARD, fg=th.INK_SUB,
-                                   font=F["small"], wraplength=460, justify="left")
-        self.lbl_record.pack(side="left", padx=6)
+        th.RoundButton(rrow, "▶ ためす", self.test_once, kind="soft",
+                       bg=th.CARD, font=F["small"], padx=10,
+                       pady=6).pack(side="left", padx=6)
+        self.lbl_record = tk.Label(c, text="", bg=th.CARD, fg=th.INK_SUB,
+                                   font=F["small"], wraplength=740, justify="left")
+        self.lbl_record.pack(anchor="w", pady=(0, 6))
+
+        self.steps_frame = tk.Frame(c, bg=th.CARD)
+        self.steps_frame.pack(fill="x", pady=(0, 8))
+        self.step_rows = []
+        self._rebuild_steps_ui()
 
         nrow = tk.Frame(c, bg=th.CARD)
         nrow.pack(fill="x", pady=(2, 4))
@@ -720,7 +738,8 @@ class MacroPanel(tk.Frame):
                  font=F["cute_b"]).pack(anchor="w", pady=(0, 4))
         self.lbl_hk = {}
         for which, title in (("hold", "かまえる"), ("always", "ずっと実行"),
-                             ("press", "長押し"), ("switch", "次のマクロへ")):
+                             ("press", "長押し"), ("switch", "次のマクロへ"),
+                             ("record", "操作を記録")):
             row = tk.Frame(hb, bg=th.CARD)
             row.pack(fill="x", pady=2)
             tk.Label(row, text=title, bg=th.CARD, fg=th.INK, font=F["small"],
@@ -742,70 +761,85 @@ class MacroPanel(tk.Frame):
 
         self.live(self.v_interval, self.v_hold, self.v_limit, self.v_delay,
                  self.v_target)
-        for st in self.steps:
-            self.live(st["gap"], st["every"])
         self.update_view()
 
-    # ---------------- 操作ステップ ----------------
+    # ---------------- 操作ステップ（一連の操作。長さの上限は無い）----------------
+    def _rebuild_steps_ui(self):
+        for w in self.steps_frame.winfo_children():
+            w.destroy()
+        self.step_rows = []
+        steps = self.app.active_profile().get("steps") or []
+        if not steps:
+            tk.Label(self.steps_frame, text="まだ操作がありません。"
+                                            "⏺ 記録開始 で覚えさせるか、"
+                                            "「＋ 手で追加」で作ってください",
+                     bg=th.CARD, fg=th.INK_SUB, font=self.F["small"]).pack(anchor="w")
+        for i, st in enumerate(steps):
+            row = self._step_row(self.steps_frame, i, st)
+            self.step_rows.append(row)
+            self.live(row["gap"])
+
     def _step_row(self, parent, i, st):
         F = self.F
         row = tk.Frame(parent, bg=th.CARD)
         row.pack(fill="x", pady=2)
-        tk.Label(row, text="%d つ目" % (i + 1), bg=th.CARD, fg=th.INK_SUB,
-                 font=F["small"], width=6, anchor="w").pack(side="left")
-        v_act = tk.StringVar()
-        cb = ttk.Combobox(row, textvariable=v_act, state="readonly", width=16,
+        tk.Label(row, text="%d" % (i + 1), bg=th.CARD, fg=th.INK_SUB,
+                 font=F["small"], width=3, anchor="e").pack(side="left")
+        v_act = tk.StringVar(
+            value=macro.action_label(st.get("action") or macro.DEFAULT_ACTION))
+        cb = ttk.Combobox(row, textvariable=v_act, state="readonly", width=14,
                           style="Cute.TCombobox", font=F["ui"])
-        vals = [lbl for _k, lbl in macro.ACTIONS]
-        if i > 0:
-            vals = ["なし"] + vals
-        cb["values"] = vals
-        act = (st.get("action") or "").strip()
-        if i > 0 and not act:
-            v_act.set("なし")
-        else:
-            v_act.set(macro.action_label(act or macro.DEFAULT_ACTION))
-        cb.pack(side="left")
+        cb["values"] = [lbl for _k, lbl in macro.ACTIONS]
+        cb.pack(side="left", padx=(2, 4))
         cb.bind("<<ComboboxSelected>>", lambda e: self.save())
 
         btn = th.RoundButton(row, "", lambda n=i: self.capture_key(n), kind="soft",
-                             bg=th.CARD, font=F["small"], padx=12, pady=5, width=170)
-        btn.pack(side="left", padx=6)
-        tk.Label(row, text="次まで", bg=th.CARD, fg=th.INK_SUB,
-                 font=F["small"]).pack(side="left")
+                             bg=th.CARD, font=F["small"], padx=8, pady=4, width=130)
+        btn.pack(side="left", padx=2)
+
+        btn_pos = th.RoundButton(row, "", lambda n=i: self.capture_pos(n),
+                                 kind="ghost", bg=th.CARD, font=F["small"],
+                                 padx=8, pady=4, width=120)
+        btn_pos.pack(side="left", padx=2)
+        th.RoundButton(row, "解除", lambda n=i: self.clear_pos(n), kind="ghost",
+                       bg=th.CARD, font=F["small"], padx=6, pady=4).pack(
+            side="left", padx=2)
+
+        tk.Label(row, text="間", bg=th.CARD, fg=th.INK_SUB, font=F["small"]).pack(
+            side="left", padx=(6, 0))
         v_gap = tk.StringVar(value=macro.fmt_secs(float(st.get("gap_ms", 120)) / 1000.0))
-        e = th.soft_entry(row, v_gap, width=8)
-        e.pack(side="left", padx=4, ipady=3)
+        e = th.soft_entry(row, v_gap, width=6)
+        e.pack(side="left", padx=2, ipady=3)
         e.bind("<FocusOut>", lambda ev: self.save())
 
-        v_every = tk.StringVar(value=str(max(1, int(st.get("every") or 1))))
-        if i > 0:
-            e2 = th.soft_entry(row, v_every, width=4)
-            e2.pack(side="left", padx=(8, 0), ipady=3)
-            e2.bind("<FocusOut>", lambda ev: self.save())
-            tk.Label(row, text="回に1度", bg=th.CARD, fg=th.INK_SUB,
-                     font=F["small"]).pack(side="left")
-
-        # 押す場所（任意）。決めておくと、いまのカーソル位置ではなくそこを押す
-        row2 = tk.Frame(parent, bg=th.CARD)
-        row2.pack(fill="x", padx=(46, 0), pady=(0, 2))
-        btn_pos = th.RoundButton(row2, "", lambda n=i: self.capture_pos(n),
-                                 kind="ghost", bg=th.CARD, font=F["small"],
-                                 padx=10, pady=3, width=150)
-        btn_pos.pack(side="left")
-        btn_clear = th.RoundButton(row2, "解除", lambda n=i: self.clear_pos(n),
-                                   kind="ghost", bg=th.CARD, font=F["small"],
-                                   padx=8, pady=3)
-        btn_clear.pack(side="left", padx=4)
-        return {"act": v_act, "cb": cb, "btn": btn, "gap": v_gap, "every": v_every,
+        th.RoundButton(row, "✕", lambda n=i: self.delete_step(n), kind="danger",
+                       bg=th.CARD, font=F["small"], padx=6, pady=4).pack(
+            side="left", padx=(6, 0))
+        return {"act": v_act, "cb": cb, "btn": btn, "btn_pos": btn_pos, "gap": v_gap,
                 "vk": int(st.get("key_vk") or 0), "scan": int(st.get("key_scan") or 0),
-                "pos": list(st["pos"]) if st.get("pos") else None,
-                "btn_pos": btn_pos, "btn_clear": btn_clear, "row2": row2}
+                "pos": list(st["pos"]) if st.get("pos") else None}
+
+    def add_step(self):
+        self.save()
+        p = self.app.active_profile()
+        p.setdefault("steps", []).append(
+            {"action": macro.DEFAULT_ACTION, "gap_ms": 300, "key_vk": 0,
+             "key_scan": 0, "pos": None})
+        self.app.save_cfg()
+        self._rebuild_steps_ui()
+        self.update_view()
+
+    def delete_step(self, i):
+        self.save()
+        steps = self.app.active_profile().get("steps") or []
+        if 0 <= i < len(steps):
+            del steps[i]
+        self.app.save_cfg()
+        self._rebuild_steps_ui()
+        self.update_view()
 
     def step_name(self, i):
-        want = self.steps[i]["act"].get()
-        if want == "なし":
-            return ""
+        want = self.step_rows[i]["act"].get()
         for k, lbl in macro.ACTIONS:
             if lbl == want:
                 return k
@@ -855,20 +889,13 @@ class MacroPanel(tk.Frame):
 
     def steps_cfg(self):
         out = []
-        for i, st in enumerate(self.steps):
+        for i, row in enumerate(self.step_rows):
             act = self.step_name(i)
-            if not act:
-                continue
-            gap = self._secs_ms(st["gap"], int(st.get("gap_ms") or 120), 0, 600000)
-            st["gap_ms"] = gap
-            try:
-                ev = max(1, min(9999, int(float(st["every"].get()))))
-            except (TypeError, ValueError):
-                ev = max(1, int(st.get("every_n") or 1))
-            st["every_n"] = ev
-            out.append({"action": act, "key_vk": st["vk"], "key_scan": st["scan"],
-                       "gap_ms": gap, "every": ev,
-                       "pos": list(st["pos"]) if st.get("pos") else None})
+            gap = self._secs_ms(row["gap"], int(row.get("gap_ms") or 120), 0, 600000)
+            row["gap_ms"] = gap
+            out.append({"action": act, "key_vk": row["vk"], "key_scan": row["scan"],
+                       "gap_ms": gap,
+                       "pos": list(row["pos"]) if row.get("pos") else None})
         return out
 
     def save(self):
@@ -917,14 +944,14 @@ class MacroPanel(tk.Frame):
     def capture_pos(self, i):
         if self._capturing or getattr(self, "_pos_rec", None) is not None:
             return
-        self.steps[i]["btn_pos"].set_text("クリックしてください…")
+        self.step_rows[i]["btn_pos"].set_text("クリックしてください…")
         self._pos_target = i
         self._pos_rec = macro.PositionRecorder(1)
         self._pos_rec.start()
         self._poll_pos()
 
     def clear_pos(self, i):
-        self.steps[i]["pos"] = None
+        self.step_rows[i]["pos"] = None
         self.save()
         self.update_view()
 
@@ -934,7 +961,7 @@ class MacroPanel(tk.Frame):
             return
         if rec.done:
             if rec.points:
-                self.steps[self._pos_target]["pos"] = list(rec.points[0])
+                self.step_rows[self._pos_target]["pos"] = list(rec.points[0])
                 self.save()
             self._pos_rec = None
             self.update_view()
@@ -960,7 +987,7 @@ class MacroPanel(tk.Frame):
             return
         self._capturing = what
         if what.startswith("key"):
-            btn = self.steps[int(what[3:])]["btn"]
+            btn = self.step_rows[int(what[3:])]["btn"]
         else:
             btn = self.lbl_hk[what.split(":", 1)[1]][0]
         btn.set_text("キーを押してください…（Escでやめる）")
@@ -995,8 +1022,8 @@ class MacroPanel(tk.Frame):
         what = self._capturing
         self._end_capture()
         if what.startswith("key"):
-            st = self.steps[int(what[3:])]
-            st["vk"], st["scan"] = vk, macro.scancode_of(vk)
+            row = self.step_rows[int(what[3:])]
+            row["vk"], row["scan"] = vk, macro.scancode_of(vk)
             self.save()
         else:
             which = what.split(":", 1)[1]
@@ -1011,22 +1038,20 @@ class MacroPanel(tk.Frame):
     # ---------------- 操作を記録する ----------------
     def toggle_record(self):
         if self.app.recorder is not None and self.app.recorder.is_alive():
-            self.app.recorder.stop()
-            self.app.recorder = None
-            self.btn_record.set_text("⏺ 操作を記録する")
-            self.lbl_record.config(text="やめました", fg=th.INK_SUB)
+            self.app.recorder.stop()          # 終わりはじめる。仕上げは_poll_recordで
             return
-        rec = macro.SequenceRecorder(macro.MAX_STEPS, on_step=self._on_record_step)
+        exclude = set()
+        if self.app.cfg.get("hotkey_record_on", True):
+            exclude.add(self.app.cfg.get("hotkey_record_vk", 0x45))
+        self.save()          # 記録で上書きする前に、今の手編集をいったん確定させる
+        rec = macro.SequenceRecorder(0, exclude_vks=exclude)
         self.app.recorder = rec
         rec.start()
-        self.btn_record.set_text("■ 記録をやめる")
+        self.btn_record.set_text("■ 記録終了")
         self.lbl_record.config(
             text="対象のアプリへ行って、実際に操作してください"
-                 "（最大3つ・Escで途中終了）", fg=th.INK)
+                 "（Esc、またはもう一度ホットキー/ボタンで終了）", fg=th.INK)
         self._poll_record()
-
-    def _on_record_step(self, _n, _st):
-        pass          # 別スレッドから来るので、表示は_poll_recordが見に行く
 
     def _poll_record(self):
         rec = self.app.recorder
@@ -1035,18 +1060,12 @@ class MacroPanel(tk.Frame):
         n = len(rec.steps)
         if rec.done:
             self.app.recorder = None
-            self.btn_record.set_text("⏺ 操作を記録する")
+            self.btn_record.set_text("⏺ 記録開始")
             if n and not (rec.cancelled and n == 0):
-                for i, st in enumerate(rec.steps[:macro.MAX_STEPS]):
-                    row = self.steps[i]
-                    row["act"].set(macro.action_label(st["action"]))
-                    row["vk"], row["scan"] = st["key_vk"], st["key_scan"]
-                    row["pos"] = list(st["pos"]) if st.get("pos") else None
-                    row["gap"].set(macro.fmt_secs(st["gap_ms"] / 1000.0))
-                for i in range(n, macro.MAX_STEPS):
-                    if i > 0:
-                        self.steps[i]["act"].set("なし")
-                self.save()
+                p = self.app.active_profile()
+                p["steps"] = [dict(s) for s in rec.steps]
+                self.app.save_cfg()
+                self._rebuild_steps_ui()
                 self.lbl_record.config(text="✅ %d個の操作を記録しました" % n,
                                        fg=th.MINT)
             else:
@@ -1055,11 +1074,11 @@ class MacroPanel(tk.Frame):
             return
         if not rec.is_alive():
             self.app.recorder = None
-            self.btn_record.set_text("⏺ 操作を記録する")
+            self.btn_record.set_text("⏺ 記録開始")
             self.update_view()
             return
         self.lbl_record.config(
-            text="記録中… あと%d個（Escで終了）" % (rec.want - n), fg=th.INK)
+            text="記録中… %d個（Escかホットキー/ボタンで終了）" % n, fg=th.INK)
         self.after(100, self._poll_record)
 
     def test_once(self):
@@ -1105,25 +1124,21 @@ class MacroPanel(tk.Frame):
         pressing = app.holder_running()
         self.btn_press.set_text("■ 離す" if pressing else "⬇ 長押し")
 
-        for i, st in enumerate(self.steps):
+        for i, row in enumerate(self.step_rows):
             name = self.step_name(i)
             if self._capturing != "key%d" % i:
                 if name == "key":
-                    st["btn"].set_text("キー: %s" % macro.vk_name(st["vk"]))
-                elif name:
-                    st["btn"].set_text("（キーのときだけ）")
+                    row["btn"].set_text("キー: %s" % macro.vk_name(row["vk"]))
                 else:
-                    st["btn"].set_text("")
-            is_mouse = bool(name) and name != "key"
-            if is_mouse:
-                st["row2"].pack(fill="x", padx=(46, 0), pady=(0, 2))
-                if getattr(self, "_pos_target", None) != i or getattr(
-                        self, "_pos_rec", None) is None:
-                    pos = st.get("pos")
-                    st["btn_pos"].set_text("📍 (%d, %d)" % tuple(pos) if pos
-                                           else "📍 押す場所を登録")
-            else:
-                st["row2"].pack_forget()
+                    row["btn"].set_text("（キーのときだけ）")
+            if getattr(self, "_pos_target", None) != i or getattr(
+                    self, "_pos_rec", None) is None:
+                if name == "key":
+                    row["btn_pos"].set_text("（マウスのときだけ）")
+                else:
+                    pos = row.get("pos")
+                    row["btn_pos"].set_text("📍 (%d, %d)" % tuple(pos) if pos
+                                            else "📍 場所を登録")
 
         for which, (btn, lbl) in self.lbl_hk.items():
             if self._capturing == "hotkey:" + which:
