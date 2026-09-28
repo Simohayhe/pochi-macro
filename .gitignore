@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+build/
+dist/
+assets/_tmp_*.png
+build_version_info.txt
