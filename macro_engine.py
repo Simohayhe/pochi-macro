@@ -717,7 +717,9 @@ class SequenceRecorder(threading.Thread):
             self.stop()
 
     def run(self):
-        watch = [vk for vk in range(8, 256) if vk not in self._MOD_VKS]
+        # 1〜255 を見る。1,2,4,5,6 はマウスの左/右/中/サイドボタン
+        # （8未満なので、ここを8からにすると丸ごと監視から漏れてしまう）
+        watch = [vk for vk in range(1, 256) if vk not in self._MOD_VKS]
         # 記録を始めた時点ですでに押さえられているキー（開始に使ったホット
         # キーなど）は、離されるまで「まだ押されている」ことにして無視する
         prev = {vk: bool(user32.GetAsyncKeyState(vk) & 0x8000) for vk in watch}

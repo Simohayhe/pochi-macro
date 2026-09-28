@@ -33,7 +33,7 @@ import winapi as wa
 
 APP_NAME = "ポチマクロ"
 APP_NAME_EN = "PochiMacro"
-APP_VERSION = "0.2.0"
+APP_VERSION = "0.2.1"
 
 
 def _res_dir():
