@@ -308,7 +308,12 @@ def post_vk(hwnd, vk, scan=None, hold_ms=20):
 
 
 def steps_of(cfg):
-    """設定から操作の並びを作る。空なら、1操作として読む。"""
+    """設定から操作の並びを作る。空なら、1操作として読む。
+
+    "pos": [x, y] が付いているマウス操作は、その画面座標へカーソルを
+    動かしてからクリックする（卵の孵化のように、決まった場所を押しつづける
+    作業のため）。付いていなければ、いまカーソルがある場所を押す。
+    """
     got = []
     for st in (cfg.get("steps") or []):
         act = (st.get("action") or "").strip()
@@ -319,7 +324,8 @@ def steps_of(cfg):
                     "key_scan": st.get("key_scan") or 0,
                     "hold_ms": st.get("hold_ms", cfg.get("hold_ms", 20)),
                     "gap_ms": st.get("gap_ms", 120),
-                    "every": max(1, int(st.get("every") or 1))})
+                    "every": max(1, int(st.get("every") or 1)),
+                    "pos": st.get("pos")})
         if len(got) >= MAX_STEPS:
             break
     if got:
@@ -328,7 +334,7 @@ def steps_of(cfg):
              "key_vk": cfg.get("key_vk") or 0,
              "key_scan": cfg.get("key_scan") or 0,
              "hold_ms": cfg.get("hold_ms", 20),
-             "gap_ms": 0, "every": 1}]
+             "gap_ms": 0, "every": 1, "pos": cfg.get("pos")}]
 
 
 def due(step, cycle):
@@ -370,6 +376,11 @@ def send_once(cfg, hwnd=None):
     hold = cfg.get("hold_ms", 20)
     if act == "key" and not vk:
         return False, "さきに送るキーを決めてください"
+
+    pos = cfg.get("pos")
+    if pos and act != "key":
+        wa.set_cursor_pos(pos[0], pos[1])
+        wa.sleep(0.02)          # カーソルが動いたのをOSが拾うのを待つ
 
     if mode == "input":
         ok = press_vk(vk, scan, hold) if act == "key" else click(act, hold)
@@ -479,6 +490,9 @@ class Holder(threading.Thread):
         act = st.get("action") or DEFAULT_ACTION
         mode = c.get("send_mode") or DEFAULT_SEND_MODE
         vk, scan = st.get("key_vk") or 0, st.get("key_scan") or 0
+        if down and act != "key" and st.get("pos"):
+            wa.set_cursor_pos(*st["pos"])
+            wa.sleep(0.02)
         if mode == "post":
             if act == "key":
                 return post_key_hold(hwnd, vk, scan, down, again)
@@ -693,12 +707,12 @@ class SequenceRecorder(threading.Thread):
         self.done = False
         self.cancelled = False
 
-    def _push(self, action, vk=0, scan=0):
+    def _push(self, action, vk=0, scan=0, pos=None):
         now = time.time()
         gap_ms = 0 if self._last_t is None else max(0, int((now - self._last_t) * 1000))
         self._last_t = now
         st = {"action": action, "key_vk": vk, "key_scan": scan, "gap_ms": gap_ms,
-              "every": 1}
+              "every": 1, "pos": list(pos) if pos else None}
         self.steps.append(st)
         if self.on_step:
             try:
@@ -713,17 +727,19 @@ class SequenceRecorder(threading.Thread):
         try:
             if code >= 0 and not self.done and not (lparam.contents.flags & LLMHF_INJECTED):
                 data = lparam.contents.mouseData
+                pt = lparam.contents.pt
+                pos = (pt.x, pt.y)
                 if wparam == WM_LBUTTONDOWN_LL:
-                    self._push("left")
+                    self._push("left", pos=pos)
                 elif wparam == WM_RBUTTONDOWN_LL:
-                    self._push("right")
+                    self._push("right", pos=pos)
                 elif wparam == 0x0207:                          # WM_MBUTTONDOWN
-                    self._push("middle")
+                    self._push("middle", pos=pos)
                 elif wparam == 0x020B:                           # WM_XBUTTONDOWN
                     xb = (data >> 16) & 0xFFFF
                     act = _XBUTTON_OF.get(xb)
                     if act:
-                        self._push(act)
+                        self._push(act, pos=pos)
         except Exception:
             pass
         return user32.CallNextHookEx(None, code, wparam, lparam)
@@ -767,6 +783,50 @@ class SequenceRecorder(threading.Thread):
     def stop(self):
         if self._tid:
             user32.PostThreadMessageW(self._tid, WM_QUIT, 0, 0)
+
+
+VK_LBUTTON = 0x01
+
+
+class PositionRecorder(threading.Thread):
+    """左クリックをwant回ぶん見張って、押した場所（画面座標）を覚える。
+
+    卵の孵化のように「決まった場所を押しつづける」操作のための、位置の
+    登録用。フックは使わず、キーの状態を細かく見に行くだけ。取りこぼしても
+    次のクリックで拾えるし、他のアプリの邪魔をしない。
+    """
+
+    def __init__(self, want=1, on_point=None):
+        super().__init__(daemon=True)
+        self.want = max(1, int(want))
+        self.on_point = on_point
+        self.points = []
+        self._halt = threading.Event()
+        self.done = False
+
+    def stop(self):
+        self._halt.set()
+
+    def run(self):
+        # 「登録する」を押したクリック自体を拾わないよう、指が離れるまで待つ
+        while not self._halt.is_set():
+            if not (user32.GetAsyncKeyState(VK_LBUTTON) & 0x8000):
+                break
+            self._halt.wait(0.02)
+        was_down = False
+        while not self._halt.is_set() and len(self.points) < self.want:
+            down = bool(user32.GetAsyncKeyState(VK_LBUTTON) & 0x8000)
+            if down and not was_down:
+                p = wa.cursor_pos()
+                self.points.append(p)
+                if self.on_point:
+                    try:
+                        self.on_point(len(self.points), p)
+                    except Exception:
+                        pass
+            was_down = down
+            self._halt.wait(0.015)
+        self.done = True
 
 
 # ---------------------------------------------------------------- ホットキー

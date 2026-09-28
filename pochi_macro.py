@@ -33,7 +33,7 @@ import winapi as wa
 
 APP_NAME = "ポチマクロ"
 APP_NAME_EN = "PochiMacro"
-APP_VERSION = "0.1.0"
+APP_VERSION = "0.1.1"
 
 
 def _res_dir():
@@ -785,8 +785,22 @@ class MacroPanel(tk.Frame):
             e2.bind("<FocusOut>", lambda ev: self.save())
             tk.Label(row, text="回に1度", bg=th.CARD, fg=th.INK_SUB,
                      font=F["small"]).pack(side="left")
+
+        # 押す場所（任意）。決めておくと、いまのカーソル位置ではなくそこを押す
+        row2 = tk.Frame(parent, bg=th.CARD)
+        row2.pack(fill="x", padx=(46, 0), pady=(0, 2))
+        btn_pos = th.RoundButton(row2, "", lambda n=i: self.capture_pos(n),
+                                 kind="ghost", bg=th.CARD, font=F["small"],
+                                 padx=10, pady=3, width=150)
+        btn_pos.pack(side="left")
+        btn_clear = th.RoundButton(row2, "解除", lambda n=i: self.clear_pos(n),
+                                   kind="ghost", bg=th.CARD, font=F["small"],
+                                   padx=8, pady=3)
+        btn_clear.pack(side="left", padx=4)
         return {"act": v_act, "cb": cb, "btn": btn, "gap": v_gap, "every": v_every,
-                "vk": int(st.get("key_vk") or 0), "scan": int(st.get("key_scan") or 0)}
+                "vk": int(st.get("key_vk") or 0), "scan": int(st.get("key_scan") or 0),
+                "pos": list(st["pos"]) if st.get("pos") else None,
+                "btn_pos": btn_pos, "btn_clear": btn_clear, "row2": row2}
 
     def step_name(self, i):
         want = self.steps[i]["act"].get()
@@ -853,7 +867,8 @@ class MacroPanel(tk.Frame):
                 ev = max(1, int(st.get("every_n") or 1))
             st["every_n"] = ev
             out.append({"action": act, "key_vk": st["vk"], "key_scan": st["scan"],
-                       "gap_ms": gap, "every": ev})
+                       "gap_ms": gap, "every": ev,
+                       "pos": list(st["pos"]) if st.get("pos") else None})
         return out
 
     def save(self):
@@ -898,6 +913,38 @@ class MacroPanel(tk.Frame):
             self.v_target.set(name)
         self.update_view()
 
+    # ---------------- 押す場所 ----------------
+    def capture_pos(self, i):
+        if self._capturing or getattr(self, "_pos_rec", None) is not None:
+            return
+        self.steps[i]["btn_pos"].set_text("クリックしてください…")
+        self._pos_target = i
+        self._pos_rec = macro.PositionRecorder(1)
+        self._pos_rec.start()
+        self._poll_pos()
+
+    def clear_pos(self, i):
+        self.steps[i]["pos"] = None
+        self.save()
+        self.update_view()
+
+    def _poll_pos(self):
+        rec = getattr(self, "_pos_rec", None)
+        if rec is None:
+            return
+        if rec.done:
+            if rec.points:
+                self.steps[self._pos_target]["pos"] = list(rec.points[0])
+                self.save()
+            self._pos_rec = None
+            self.update_view()
+            return
+        if not rec.is_alive():
+            self._pos_rec = None
+            self.update_view()
+            return
+        self.after(80, self._poll_pos)
+
     # ---------------- キー取り込み ----------------
     def capture_key(self, i=0):
         self._capture("key%d" % i)
@@ -908,6 +955,8 @@ class MacroPanel(tk.Frame):
     def _capture(self, what):
         if self._capturing:
             self._end_capture()
+            return
+        if getattr(self, "_pos_rec", None) is not None:
             return
         self._capturing = what
         if what.startswith("key"):
@@ -992,6 +1041,7 @@ class MacroPanel(tk.Frame):
                     row = self.steps[i]
                     row["act"].set(macro.action_label(st["action"]))
                     row["vk"], row["scan"] = st["key_vk"], st["key_scan"]
+                    row["pos"] = list(st["pos"]) if st.get("pos") else None
                     row["gap"].set(macro.fmt_secs(st["gap_ms"] / 1000.0))
                 for i in range(n, macro.MAX_STEPS):
                     if i > 0:
@@ -1056,14 +1106,24 @@ class MacroPanel(tk.Frame):
         self.btn_press.set_text("■ 離す" if pressing else "⬇ 長押し")
 
         for i, st in enumerate(self.steps):
-            if self._capturing == "key%d" % i:
-                continue
-            if self.step_name(i) == "key":
-                st["btn"].set_text("キー: %s" % macro.vk_name(st["vk"]))
-            elif self.step_name(i):
-                st["btn"].set_text("（キーのときだけ）")
+            name = self.step_name(i)
+            if self._capturing != "key%d" % i:
+                if name == "key":
+                    st["btn"].set_text("キー: %s" % macro.vk_name(st["vk"]))
+                elif name:
+                    st["btn"].set_text("（キーのときだけ）")
+                else:
+                    st["btn"].set_text("")
+            is_mouse = bool(name) and name != "key"
+            if is_mouse:
+                st["row2"].pack(fill="x", padx=(46, 0), pady=(0, 2))
+                if getattr(self, "_pos_target", None) != i or getattr(
+                        self, "_pos_rec", None) is None:
+                    pos = st.get("pos")
+                    st["btn_pos"].set_text("📍 (%d, %d)" % tuple(pos) if pos
+                                           else "📍 押す場所を登録")
             else:
-                st["btn"].set_text("")
+                st["row2"].pack_forget()
 
         for which, (btn, lbl) in self.lbl_hk.items():
             if self._capturing == "hotkey:" + which:

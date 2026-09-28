@@ -180,3 +180,7 @@ def cursor_pos():
     pt = wintypes.POINT()
     user32.GetCursorPos(ctypes.byref(pt))
     return int(pt.x), int(pt.y)
+
+
+def set_cursor_pos(x, y):
+    return bool(user32.SetCursorPos(int(x), int(y)))
