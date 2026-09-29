@@ -184,3 +184,31 @@ def cursor_pos():
 
 def set_cursor_pos(x, y):
     return bool(user32.SetCursorPos(int(x), int(y)))
+
+
+MOUSEEVENTF_MOVE = 0x0001
+MOUSEEVENTF_ABSOLUTE = 0x8000
+MOUSEEVENTF_VIRTUALDESK = 0x4000
+SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN = 76, 77
+SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN = 78, 79
+
+
+def move_abs(x, y):
+    """SendInputで、本物のマウス移動と同じ形をした移動イベントを送る。
+
+    SetCursorPosは見た目のカーソル位置を直接動かすだけで、マウスが動いた
+    というイベント自体は発生しない。Raw Input(WM_INPUT)でクリックの位置を
+    直前の移動から拾っているゲームだと、SetCursorPosだけでは押した場所が
+    正しく伝わらないことがあるため、こちらも試す。
+    """
+    vx = user32.GetSystemMetrics(SM_XVIRTUALSCREEN)
+    vy = user32.GetSystemMetrics(SM_YVIRTUALSCREEN)
+    vw = max(1, user32.GetSystemMetrics(SM_CXVIRTUALSCREEN))
+    vh = max(1, user32.GetSystemMetrics(SM_CYVIRTUALSCREEN))
+    nx = int((int(x) - vx) * 65536 / vw)
+    ny = int((int(y) - vy) * 65536 / vh)
+    flags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK
+    a = INPUT(type=INPUT_MOUSE,
+             u=_INPUTUNION(mi=MOUSEINPUT(dx=nx, dy=ny, mouseData=0,
+                                         dwFlags=flags, time=0, dwExtraInfo=0)))
+    return user32.SendInput(1, ctypes.byref(a), ctypes.sizeof(INPUT)) == 1

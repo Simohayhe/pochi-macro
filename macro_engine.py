@@ -378,7 +378,12 @@ def send_once(cfg, hwnd=None):
 
     pos = cfg.get("pos")
     if pos and act != "key":
-        wa.set_cursor_pos(pos[0], pos[1])
+        # SetCursorPosだけだと見た目のカーソルが動くだけで「移動した」という
+        # 入力イベントが発生しない。Raw Inputで直前の移動からクリック位置を
+        # 拾うゲームのために、本物の移動と同じ形のSendInputも送っておく。
+        wa.move_abs(pos[0], pos[1])
+        wa.sleep(0.01)
+        wa.set_cursor_pos(pos[0], pos[1])   # 丸め誤差を吸収して正確な座標に直す
         wa.sleep(0.02)          # カーソルが動いたのをOSが拾うのを待つ
 
     if mode == "input":
