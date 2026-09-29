@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """ポチマクロ — マウス/キーボードの操作を記録・繰り返し実行するマクロツール
 
-・一連の操作（クリック・キー、長さの上限なし）を記録して、そのまま繰り返し実行
+・一連の操作（マウスの動き・クリック・キー、長さの上限なし）を記録して、そのまま繰り返し実行
 ・押す場所を画面座標で登録可能（卵の孵化のように決まった場所を押しつづける用途）
 ・マクロを複数保存して切り替え
 ・グローバルホットキーで入切（記録の開始/終了もホットキーから）
@@ -33,7 +33,7 @@ import winapi as wa
 
 APP_NAME = "ポチマクロ"
 APP_NAME_EN = "PochiMacro"
-APP_VERSION = "0.3.1"
+APP_VERSION = "0.4.0"
 
 
 def _res_dir():
@@ -663,10 +663,11 @@ class MacroPanel(tk.Frame):
         th.RoundButton(rrow, "▶ ためす", self.test_once, kind="soft",
                        bg=th.CARD, font=F["small"], padx=10,
                        pady=6).pack(side="left", padx=6)
-        tk.Label(c, text="⏺ 操作を記録 はクリック／キー入力をそのまま拾いますが、"
-                        "ゲームによっては（とくに最前面にしたとき）拾えないこと"
-                        "があります。そのときは上の「場所を順番に教える」を"
-                        "使ってください",
+        tk.Label(c, text="⏺ 操作を記録 はマウスの動き・クリック・キー入力を、"
+                        "そのままの軌跡と間隔で丸ごと拾います。ただしゲーム"
+                        "によっては（とくに最前面にしたとき）入力そのものを"
+                        "拾えないことがあります。そのときは上の「場所を順番に"
+                        "教える」を使ってください",
                  bg=th.CARD, fg=th.INK_SUB, font=F["small"], wraplength=740,
                  justify="left").pack(anchor="w", pady=(0, 2))
         self.lbl_record = tk.Label(c, text="", bg=th.CARD, fg=th.INK_SUB,
@@ -812,6 +813,26 @@ class MacroPanel(tk.Frame):
         row.pack(fill="x", pady=2)
         tk.Label(row, text="%d" % (i + 1), bg=th.CARD, fg=th.INK_SUB,
                  font=F["small"], width=3, anchor="e").pack(side="left")
+
+        if (st.get("action") or "") == "move_path":
+            path = st.get("path") or []
+            total_s = sum(p[2] for p in path) / 1000.0
+            tk.Label(row, text="🖱 動き（%d点・%.1f秒）" % (len(path), total_s),
+                     bg=th.CARD, fg=th.INK, font=F["ui"]).pack(side="left",
+                                                               padx=(2, 4))
+            tk.Label(row, text="間", bg=th.CARD, fg=th.INK_SUB,
+                     font=F["small"]).pack(side="left", padx=(6, 0))
+            v_gap = tk.StringVar(
+                value=macro.fmt_secs(float(st.get("gap_ms", 0)) / 1000.0))
+            e = th.soft_entry(row, v_gap, width=6)
+            e.pack(side="left", padx=2, ipady=3)
+            e.bind("<FocusOut>", lambda ev: self.save())
+            th.RoundButton(row, "✕", lambda n=i: self.delete_step(n),
+                           kind="danger", bg=th.CARD, font=F["small"], padx=6,
+                           pady=4).pack(side="left", padx=(6, 0))
+            return {"is_path": True, "path": path, "gap": v_gap,
+                    "gap_ms": st.get("gap_ms", 0)}
+
         v_act = tk.StringVar(
             value=macro.action_label(st.get("action") or macro.DEFAULT_ACTION))
         cb = ttk.Combobox(row, textvariable=v_act, state="readonly", width=14,
@@ -866,7 +887,10 @@ class MacroPanel(tk.Frame):
         self.update_view()
 
     def step_name(self, i):
-        want = self.step_rows[i]["act"].get()
+        row = self.step_rows[i]
+        if row.get("is_path"):
+            return "move_path"
+        want = row["act"].get()
         for k, lbl in macro.ACTIONS:
             if lbl == want:
                 return k
@@ -917,6 +941,14 @@ class MacroPanel(tk.Frame):
     def steps_cfg(self):
         out = []
         for i, row in enumerate(self.step_rows):
+            if row.get("is_path"):
+                gap = self._secs_ms(row["gap"], int(row.get("gap_ms") or 0),
+                                    0, 600000)
+                row["gap_ms"] = gap
+                out.append({"action": "move_path", "path": row["path"],
+                           "gap_ms": gap, "pos": None, "key_vk": 0,
+                           "key_scan": 0})
+                continue
             act = self.step_name(i)
             gap = self._secs_ms(row["gap"], int(row.get("gap_ms") or 120), 0, 600000)
             row["gap_ms"] = gap
@@ -1216,6 +1248,8 @@ class MacroPanel(tk.Frame):
         self.btn_press.set_text("■ 離す" if pressing else "⬇ 長押し")
 
         for i, row in enumerate(self.step_rows):
+            if row.get("is_path"):
+                continue
             name = self.step_name(i)
             if self._capturing != "key%d" % i:
                 if name == "key":

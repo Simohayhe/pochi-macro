@@ -126,6 +126,8 @@ def fmt_secs(sec):
 
 
 def action_label(name):
+    if name == "move_path":
+        return "🖱 動き"
     for k, lbl in ACTIONS:
         if k == name:
             return lbl
@@ -326,7 +328,8 @@ def steps_of(cfg):
                     "hold_ms": st.get("hold_ms", cfg.get("hold_ms", 20)),
                     "gap_ms": st.get("gap_ms", 120),
                     "every": max(1, int(st.get("every") or 1)),
-                    "pos": st.get("pos")})
+                    "pos": st.get("pos"),
+                    "path": st.get("path")})
     if got:
         return got
     return [{"action": cfg.get("action") or DEFAULT_ACTION,
@@ -345,26 +348,58 @@ def due(step, cycle):
 
 
 def send_seq(cfg, hwnd=None, halt=None, cycle=None):
-    """操作の並びを、あいだを空けながら順に送る。"""
+    """操作の並びを、あいだを空けながら順に送る。
+
+    各ステップの gap_ms は「そのステップのあとに次まで待つ時間」という意味で
+    統一している（手で編集する「次まで」欄と、記録した実測の間隔の両方）。
+    """
     steps = [st for st in steps_of(cfg) if due(st, cycle)]
     sent, why = 0, ""
     for i, st in enumerate(steps):
         if halt is not None and halt.is_set():
             break
-        one = dict(cfg)
-        one.update(st)
-        ok, msg = send_once(one, hwnd)
+        if st.get("action") == "move_path":
+            ok = send_move_path(st, halt)
+        else:
+            one = dict(cfg)
+            one.update(st)
+            ok, msg = send_once(one, hwnd)
+            if not ok and msg:
+                why = msg
         if ok:
             sent += 1
-        elif msg:
-            why = msg
         if i + 1 < len(steps):
             gap = max(0.0, float(st.get("gap_ms") or 0) / 1000.0)
             if halt is not None:
-                halt.wait(gap)
+                if halt.wait(gap):
+                    break
             elif gap:
                 wa.sleep(gap)
     return sent > 0, why
+
+
+def send_move_path(step, halt=None):
+    """記録した「一連の動き」を、そのときの速さのまま再現する。
+
+    経路の各点は [x, y, 直前の点からの経過ミリ秒]。マウスの見た目位置(SetCursorPos)
+    と、本物の移動と同じ形の入力(move_abs)の両方を送る。halt を渡せば、
+    マクロを止めたときに経路の途中でもすぐ抜けられる。
+    """
+    sent = False
+    for x, y, dt_ms in (step.get("path") or []):
+        if halt is not None and halt.is_set():
+            break
+        wait = max(0.0, float(dt_ms or 0) / 1000.0)
+        if wait:
+            if halt is not None:
+                if halt.wait(wait):
+                    break
+            else:
+                wa.sleep(wait)
+        wa.move_abs(x, y)
+        wa.set_cursor_pos(x, y)
+        sent = True
+    return sent
 
 
 def send_once(cfg, hwnd=None):
@@ -674,14 +709,27 @@ _MOUSE_VK_ACTIONS = {0x01: "left", 0x02: "right", 0x04: "middle",
                     0x05: "x1", 0x06: "x2"}
 
 
+MAX_PATH_POINTS = 4000        # 1回の動きにつける経路の点の数の安全弁
+
+
 class SequenceRecorder(threading.Thread):
-    """実際の操作（マウスクリック・キー押下）を、一連の流れとして記録する。
+    """実際の操作（マウスの動き・クリック・キー押下）を、一連の流れとして記録する。
 
     低レベルフック(SetWindowsHookEx)ではなく GetAsyncKeyState による
     ポーリングで拾う。ゲームによっては（とくに管理者権限で動いているとき）
     UIPIに阻まれてフックが本物の入力を拾えないことがあり、記録できない
     原因になっていた。ポーリングはそれを迂回できる
     （Meridianの「たまごマクロ」の位置記録と同じ、実績のあるやり方）。
+
+    クリック/キーだけでなく、そのあいだのマウスの動きも "move_path" という
+    種類のステップとして丸ごと記録する（点ごとの座標と直前からの経過時間）。
+    テレポートするような移動ではなく本物の軌跡で再現したほうが、Raw Input
+    で判定しているゲームでクリックが通りやすくなることがあるため。
+
+    どのステップの gap_ms も「そのステップのあと、次まで待つ時間」という
+    統一した意味にしている。記録中は逆に「直前の出来事からの経過時間」しか
+    分からないので、新しい出来事が起きた瞬間に**ひとつ前のステップ**の
+    gap_ms を実測値で確定させる（_mark_gap）。
 
     want=0なら無制限（stop()が呼ばれる、またはEscで終わるまで記録する）。
     exclude_vksに渡したキー／ボタン（記録の開始・終了に使ったホットキー等）
@@ -704,12 +752,7 @@ class SequenceRecorder(threading.Thread):
     def stop(self):
         self._halt.set()
 
-    def _push(self, action, vk=0, scan=0, pos=None):
-        now = time.time()
-        gap_ms = 0 if self._last_t is None else max(0, int((now - self._last_t) * 1000))
-        self._last_t = now
-        st = {"action": action, "key_vk": vk, "key_scan": scan, "gap_ms": gap_ms,
-              "every": 1, "pos": list(pos) if pos else None}
+    def _emit(self, st):
         self.steps.append(st)
         if self.on_step:
             try:
@@ -721,6 +764,32 @@ class SequenceRecorder(threading.Thread):
             self.done = True
             self.stop()
 
+    def _mark_gap(self, now):
+        """直前のステップの「次まで」を、いま確定した実測の間隔で埋める。"""
+        if self.steps and self._last_t is not None:
+            self.steps[-1]["gap_ms"] = max(0, int((now - self._last_t) * 1000))
+        self._last_t = now
+
+    def _push_action(self, action, vk=0, scan=0, pos=None):
+        now = time.time()
+        self._mark_gap(now)
+        self._emit({"action": action, "key_vk": vk, "key_scan": scan,
+                   "gap_ms": 0, "every": 1, "pos": list(pos) if pos else None})
+
+    def _flush_path(self, buf):
+        """溜めておいた移動の点を、1つの"move_path"ステップにして確定する。"""
+        if self.done or len(buf) < 2:
+            return
+        start_t = buf[0][2]
+        self._mark_gap(start_t)
+        path, prev_t = [], start_t
+        for x, y, t in buf:
+            path.append([x, y, max(0, int((t - prev_t) * 1000))])
+            prev_t = t
+        self._emit({"action": "move_path", "path": path, "gap_ms": 0,
+                   "every": 1, "pos": None, "key_vk": 0, "key_scan": 0})
+        self._last_t = buf[-1][2]
+
     def run(self):
         # 1〜255 を見る。1,2,4,5,6 はマウスの左/右/中/サイドボタン
         # （8未満なので、ここを8からにすると丸ごと監視から漏れてしまう）
@@ -728,7 +797,15 @@ class SequenceRecorder(threading.Thread):
         # 記録を始めた時点ですでに押さえられているキー（開始に使ったホット
         # キーなど）は、離されるまで「まだ押されている」ことにして無視する
         prev = {vk: bool(user32.GetAsyncKeyState(vk) & 0x8000) for vk in watch}
+        p0 = wa.cursor_pos()
+        buf = [(p0[0], p0[1], time.time())]
         while not self._halt.is_set() and not self.done:
+            pos = wa.cursor_pos()
+            if pos != buf[-1][:2]:
+                buf.append((pos[0], pos[1], time.time()))
+                if len(buf) > MAX_PATH_POINTS:
+                    self._flush_path(buf)
+                    buf = [(pos[0], pos[1], time.time())]
             for vk in watch:
                 down = bool(user32.GetAsyncKeyState(vk) & 0x8000)
                 if down and not prev[vk]:
@@ -738,16 +815,18 @@ class SequenceRecorder(threading.Thread):
                         prev[vk] = down
                         break
                     if vk not in self.exclude:
+                        self._flush_path(buf)
+                        buf = [(pos[0], pos[1], time.time())]
                         act = _MOUSE_VK_ACTIONS.get(vk)
                         if act:
-                            self._push(act, pos=wa.cursor_pos())
+                            self._push_action(act, pos=pos)
                         else:
-                            self._push("key", vk, wa.scancode_of(vk))
+                            self._push_action("key", vk, wa.scancode_of(vk))
                 prev[vk] = down
                 if self.done:
                     break
             if not self.done:
-                self._halt.wait(0.012)
+                self._halt.wait(0.015)
         self.done = True
 
 
