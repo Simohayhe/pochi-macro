@@ -33,7 +33,7 @@ import winapi as wa
 
 APP_NAME = "ポチマクロ"
 APP_NAME_EN = "PochiMacro"
-APP_VERSION = "0.4.0"
+APP_VERSION = "0.4.1"
 
 
 def _res_dir():
@@ -650,6 +650,7 @@ class MacroPanel(tk.Frame):
                                   wraplength=740, justify="left")
         self.lbl_teach.pack(anchor="w", pady=(2, 8))
         self._teach = None
+        self._record_wait = None
 
         rrow = tk.Frame(c, bg=th.CARD)
         rrow.pack(fill="x", pady=(0, 4))
@@ -1101,6 +1102,8 @@ class MacroPanel(tk.Frame):
         if self._teach is not None:
             self._stop_teach("やめました")
             return
+        if self._record_wait is not None:
+            self._cancel_record_wait("")
         if self.app.recorder is not None and self.app.recorder.is_alive():
             self.app.recorder.stop()
         self.save()
@@ -1157,23 +1160,59 @@ class MacroPanel(tk.Frame):
         self.lbl_teach.config(text=msg, fg=th.INK_SUB)
 
     # ---------------- 操作を記録する ----------------
+    RECORD_COUNTDOWN_SEC = 3.0
+
     def toggle_record(self):
-        if self._teach is not None:
-            self._stop_teach("")
+        # カウントダウン中に押されたら、それは「まだ記録していない」のでやめるだけ
+        if self._record_wait is not None:
+            self._cancel_record_wait("やめました")
+            return
         if self.app.recorder is not None and self.app.recorder.is_alive():
             self.app.recorder.stop()          # 終わりはじめる。仕上げは_poll_recordで
             return
+        if self._teach is not None:
+            self._stop_teach("")
+        self.save()          # 記録で上書きする前に、今の手編集をいったん確定させる
+        self.btn_record.set_text("■ キャンセル")
+        self._record_wait = {"remain": self.RECORD_COUNTDOWN_SEC, "job": None}
+        self._record_wait_tick()
+
+    def _record_wait_tick(self):
+        w = self._record_wait
+        if w is None:
+            return
+        if w["remain"] <= 0:
+            self._record_wait = None
+            self._start_recording()
+            return
+        self.lbl_record.config(
+            text="対象のアプリへ切り替えてください。あと%.1f秒で記録が"
+                 "始まります（ボタンでやめられます）" % w["remain"], fg=th.INK)
+        w["remain"] -= 0.2
+        w["job"] = self.after(200, self._record_wait_tick)
+
+    def _cancel_record_wait(self, msg):
+        w = self._record_wait
+        if w is not None and w.get("job") is not None:
+            try:
+                self.after_cancel(w["job"])
+            except Exception:
+                pass
+        self._record_wait = None
+        self.btn_record.set_text("⏺ 記録開始")
+        self.lbl_record.config(text=msg, fg=th.INK_SUB)
+
+    def _start_recording(self):
         exclude = set()
         if self.app.cfg.get("hotkey_record_on", True):
             exclude.add(self.app.cfg.get("hotkey_record_vk", 0x45))
-        self.save()          # 記録で上書きする前に、今の手編集をいったん確定させる
         rec = macro.SequenceRecorder(0, exclude_vks=exclude)
         self.app.recorder = rec
         rec.start()
         self.btn_record.set_text("■ 記録終了")
         self.lbl_record.config(
-            text="対象のアプリへ行って、実際に操作してください"
-                 "（Esc、またはもう一度ホットキー/ボタンで終了）", fg=th.INK)
+            text="記録中です。対象のアプリで実際に操作してください"
+                 "（Esc、またはもう一度ホットキー/ボタンで終了）", fg=th.MINT)
         self._poll_record()
 
     def _poll_record(self):
